@@ -1,80 +1,93 @@
 from flask import Flask, render_template, request, jsonify
-import sqlite3
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
 
 app = Flask(__name__)
 
+# Vercel Postgres 연결
+def get_db():
+    # Vercel이 자동으로 제공하는 환경변수
+    database_url = os.environ.get('POSTGRES_URL')
+    if not database_url:
+        # 로컬 개발용 폴백
+        database_url = os.environ.get('DATABASE_URL', 'postgresql://localhost/inventory')
+    
+    conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
+    return conn
+
 # 데이터베이스 초기화
 def init_db():
-    conn = sqlite3.connect('inventory.db')
-    cursor = conn.cursor()
-    
-    queries = [
-        '''CREATE TABLE IF NOT EXISTS products (
-            product_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_code TEXT UNIQUE NOT NULL,
-            product_name TEXT NOT NULL,
-            category TEXT,
-            unit_price REAL NOT NULL,
-            supplier TEXT,
-            description TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''',
-        '''CREATE TABLE IF NOT EXISTS inventory (
-            inventory_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            product_id INTEGER NOT NULL,
-            quantity INTEGER NOT NULL DEFAULT 0,
-            min_quantity INTEGER DEFAULT 10,
-            location TEXT,
-            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
-        )''',
-        '''CREATE TABLE IF NOT EXISTS customers (
-            customer_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_code TEXT UNIQUE NOT NULL,
-            customer_name TEXT NOT NULL,
-            contact TEXT,
-            address TEXT,
-            email TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )''',
-        '''CREATE TABLE IF NOT EXISTS sales (
-            sale_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER NOT NULL,
-            sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            total_amount REAL NOT NULL,
-            payment_status TEXT DEFAULT '미수',
-            notes TEXT,
-            FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
-        )''',
-        '''CREATE TABLE IF NOT EXISTS sale_details (
-            detail_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            sale_id INTEGER NOT NULL,
-            product_id INTEGER NOT NULL,
-            quantity INTEGER NOT NULL,
-            unit_price REAL NOT NULL,
-            subtotal REAL NOT NULL,
-            FOREIGN KEY (sale_id) REFERENCES sales(sale_id) ON DELETE CASCADE,
-            FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
-        )'''
-    ]
-    
-    for query in queries:
-        cursor.execute(query)
-    
-    cursor.execute("PRAGMA foreign_keys = ON;")
-    conn.commit()
-    conn.close()
-
-def get_db():
-    conn = sqlite3.connect('inventory.db')
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        conn = get_db()
+        cursor = conn.cursor()
+        
+        queries = [
+            '''CREATE TABLE IF NOT EXISTS products (
+                product_id SERIAL PRIMARY KEY,
+                product_code VARCHAR(100) UNIQUE NOT NULL,
+                product_name VARCHAR(200) NOT NULL,
+                category VARCHAR(100),
+                unit_price DECIMAL(12,2) NOT NULL,
+                supplier VARCHAR(200),
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''',
+            '''CREATE TABLE IF NOT EXISTS inventory (
+                inventory_id SERIAL PRIMARY KEY,
+                product_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                min_quantity INTEGER DEFAULT 10,
+                location VARCHAR(100),
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
+            )''',
+            '''CREATE TABLE IF NOT EXISTS customers (
+                customer_id SERIAL PRIMARY KEY,
+                customer_code VARCHAR(100) UNIQUE NOT NULL,
+                customer_name VARCHAR(200) NOT NULL,
+                contact VARCHAR(50),
+                address TEXT,
+                email VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )''',
+            '''CREATE TABLE IF NOT EXISTS sales (
+                sale_id SERIAL PRIMARY KEY,
+                customer_id INTEGER NOT NULL,
+                sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                total_amount DECIMAL(12,2) NOT NULL,
+                payment_status VARCHAR(20) DEFAULT '미수',
+                notes TEXT,
+                FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE
+            )''',
+            '''CREATE TABLE IF NOT EXISTS sale_details (
+                detail_id SERIAL PRIMARY KEY,
+                sale_id INTEGER NOT NULL,
+                product_id INTEGER NOT NULL,
+                quantity INTEGER NOT NULL,
+                unit_price DECIMAL(12,2) NOT NULL,
+                subtotal DECIMAL(12,2) NOT NULL,
+                FOREIGN KEY (sale_id) REFERENCES sales(sale_id) ON DELETE CASCADE,
+                FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE CASCADE
+            )'''
+        ]
+        
+        for query in queries:
+            cursor.execute(query)
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"데이터베이스 초기화 오류: {e}")
+        return False
 
 # 라우트
 @app.route('/')
 def index():
+    # 앱 시작시 테이블 생성
+    init_db()
     return render_template('index.html')
 
 @app.route('/api/products', methods=['GET', 'POST'])
@@ -86,67 +99,87 @@ def products():
         data = request.json
         try:
             cursor.execute(
-                'INSERT INTO products (product_code, product_name, category, unit_price, supplier, description) VALUES (?, ?, ?, ?, ?, ?)',
+                'INSERT INTO products (product_code, product_name, category, unit_price, supplier, description) VALUES (%s, %s, %s, %s, %s, %s) RETURNING product_id',
                 (data['product_code'], data['product_name'], data.get('category', ''), 
                  data['unit_price'], data.get('supplier', ''), data.get('description', ''))
             )
-            product_id = cursor.lastrowid
-            cursor.execute('INSERT INTO inventory (product_id) VALUES (?)', (product_id,))
+            result = cursor.fetchone()
+            product_id = result['product_id']
+            cursor.execute('INSERT INTO inventory (product_id) VALUES (%s)', (product_id,))
             conn.commit()
-            return jsonify({'success': True, 'message': '제품이 등록되었습니다'})
-        except sqlite3.IntegrityError:
-            return jsonify({'success': False, 'message': '이미 존재하는 제품 코드입니다'}), 400
-        finally:
             conn.close()
+            return jsonify({'success': True, 'message': '제품이 등록되었습니다'})
+        except psycopg2.IntegrityError as e:
+            conn.rollback()
+            conn.close()
+            return jsonify({'success': False, 'message': '이미 존재하는 제품 코드입니다'}), 400
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            return jsonify({'success': False, 'message': f'오류 발생: {str(e)}'}), 500
     
     else:  # GET
-        search = request.args.get('search', '')
-        if search:
-            cursor.execute(
-                'SELECT * FROM products WHERE product_name LIKE ? ORDER BY product_id DESC',
-                (f'%{search}%',)
-            )
-        else:
-            cursor.execute('SELECT * FROM products ORDER BY product_id DESC')
-        
-        products = [dict(row) for row in cursor.fetchall()]
-        conn.close()
-        return jsonify(products)
+        try:
+            search = request.args.get('search', '')
+            if search:
+                cursor.execute(
+                    'SELECT * FROM products WHERE product_name ILIKE %s ORDER BY product_id DESC',
+                    (f'%{search}%',)
+                )
+            else:
+                cursor.execute('SELECT * FROM products ORDER BY product_id DESC')
+            
+            products = cursor.fetchall()
+            conn.close()
+            return jsonify(products)
+        except Exception as e:
+            conn.close()
+            return jsonify({'error': str(e)}), 500
 
 @app.route('/api/products/<int:product_id>', methods=['PUT', 'DELETE'])
 def product_detail(product_id):
     conn = get_db()
     cursor = conn.cursor()
     
-    if request.method == 'PUT':
-        data = request.json
-        cursor.execute(
-            'UPDATE products SET product_code=?, product_name=?, category=?, unit_price=?, supplier=?, description=? WHERE product_id=?',
-            (data['product_code'], data['product_name'], data.get('category', ''),
-             data['unit_price'], data.get('supplier', ''), data.get('description', ''), product_id)
-        )
-        conn.commit()
+    try:
+        if request.method == 'PUT':
+            data = request.json
+            cursor.execute(
+                'UPDATE products SET product_code=%s, product_name=%s, category=%s, unit_price=%s, supplier=%s, description=%s WHERE product_id=%s',
+                (data['product_code'], data['product_name'], data.get('category', ''),
+                 data['unit_price'], data.get('supplier', ''), data.get('description', ''), product_id)
+            )
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': '제품이 수정되었습니다'})
+        
+        elif request.method == 'DELETE':
+            cursor.execute('DELETE FROM products WHERE product_id=%s', (product_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': '제품이 삭제되었습니다'})
+    except Exception as e:
+        conn.rollback()
         conn.close()
-        return jsonify({'success': True, 'message': '제품이 수정되었습니다'})
-    
-    elif request.method == 'DELETE':
-        cursor.execute('DELETE FROM products WHERE product_id=?', (product_id,))
-        conn.commit()
-        conn.close()
-        return jsonify({'success': True, 'message': '제품이 삭제되었습니다'})
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/inventory', methods=['GET'])
 def inventory():
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT p.product_id, p.product_code, p.product_name, i.quantity, i.min_quantity, i.location, i.last_updated
-        FROM inventory i JOIN products p ON i.product_id = p.product_id
-        ORDER BY p.product_name
-    ''')
-    inventory = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return jsonify(inventory)
+    
+    try:
+        cursor.execute('''
+            SELECT p.product_id, p.product_code, p.product_name, i.quantity, i.min_quantity, i.location, i.last_updated
+            FROM inventory i JOIN products p ON i.product_id = p.product_id
+            ORDER BY p.product_name
+        ''')
+        inventory = cursor.fetchall()
+        conn.close()
+        return jsonify(inventory)
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/inventory/transaction', methods=['POST'])
 def inventory_transaction():
@@ -157,22 +190,28 @@ def inventory_transaction():
     try:
         product_id = data['product_id']
         quantity = data['quantity']
-        trans_type = data['type']  # '입고' or '출고'
+        trans_type = data['type']
         
-        cursor.execute('SELECT quantity FROM inventory WHERE product_id=?', (product_id,))
-        current_qty = cursor.fetchone()[0]
+        cursor.execute('SELECT quantity FROM inventory WHERE product_id=%s', (product_id,))
+        result = cursor.fetchone()
+        if not result:
+            return jsonify({'success': False, 'message': '제품을 찾을 수 없습니다'}), 404
+            
+        current_qty = result['quantity']
         
         if trans_type == '출고' and current_qty < quantity:
+            conn.close()
             return jsonify({'success': False, 'message': '재고가 부족합니다'}), 400
         
         new_qty = current_qty + quantity if trans_type == '입고' else current_qty - quantity
-        cursor.execute('UPDATE inventory SET quantity=?, last_updated=CURRENT_TIMESTAMP WHERE product_id=?', 
+        cursor.execute('UPDATE inventory SET quantity=%s, last_updated=CURRENT_TIMESTAMP WHERE product_id=%s', 
                       (new_qty, product_id))
         conn.commit()
         conn.close()
         
         return jsonify({'success': True, 'message': f'{trans_type} 처리가 완료되었습니다'})
     except Exception as e:
+        conn.rollback()
         conn.close()
         return jsonify({'success': False, 'message': str(e)}), 500
 
@@ -185,30 +224,66 @@ def customers():
         data = request.json
         try:
             cursor.execute(
-                'INSERT INTO customers (customer_code, customer_name, contact, email, address) VALUES (?, ?, ?, ?, ?)',
+                'INSERT INTO customers (customer_code, customer_name, contact, email, address) VALUES (%s, %s, %s, %s, %s)',
                 (data['customer_code'], data['customer_name'], data.get('contact', ''),
                  data.get('email', ''), data.get('address', ''))
             )
             conn.commit()
-            return jsonify({'success': True, 'message': '거래처가 등록되었습니다'})
-        except sqlite3.IntegrityError:
-            return jsonify({'success': False, 'message': '이미 존재하는 거래처 코드입니다'}), 400
-        finally:
             conn.close()
+            return jsonify({'success': True, 'message': '거래처가 등록되었습니다'})
+        except psycopg2.IntegrityError:
+            conn.rollback()
+            conn.close()
+            return jsonify({'success': False, 'message': '이미 존재하는 거래처 코드입니다'}), 400
+        except Exception as e:
+            conn.rollback()
+            conn.close()
+            return jsonify({'success': False, 'message': str(e)}), 500
     
     else:  # GET
-        search = request.args.get('search', '')
-        if search:
+        try:
+            search = request.args.get('search', '')
+            if search:
+                cursor.execute(
+                    'SELECT * FROM customers WHERE customer_name ILIKE %s ORDER BY customer_id DESC',
+                    (f'%{search}%',)
+                )
+            else:
+                cursor.execute('SELECT * FROM customers ORDER BY customer_id DESC')
+            
+            customers = cursor.fetchall()
+            conn.close()
+            return jsonify(customers)
+        except Exception as e:
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/customers/<int:customer_id>', methods=['PUT', 'DELETE'])
+def customer_detail(customer_id):
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    try:
+        if request.method == 'PUT':
+            data = request.json
             cursor.execute(
-                'SELECT * FROM customers WHERE customer_name LIKE ? ORDER BY customer_id DESC',
-                (f'%{search}%',)
+                'UPDATE customers SET customer_code=%s, customer_name=%s, contact=%s, email=%s, address=%s WHERE customer_id=%s',
+                (data['customer_code'], data['customer_name'], data.get('contact', ''),
+                 data.get('email', ''), data.get('address', ''), customer_id)
             )
-        else:
-            cursor.execute('SELECT * FROM customers ORDER BY customer_id DESC')
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': '거래처가 수정되었습니다'})
         
-        customers = [dict(row) for row in cursor.fetchall()]
+        elif request.method == 'DELETE':
+            cursor.execute('DELETE FROM customers WHERE customer_id=%s', (customer_id,))
+            conn.commit()
+            conn.close()
+            return jsonify({'success': True, 'message': '거래처가 삭제되었습니다'})
+    except Exception as e:
+        conn.rollback()
         conn.close()
-        return jsonify(customers)
+        return jsonify({'success': False, 'message': str(e)}), 500
 
 @app.route('/api/sales', methods=['GET', 'POST'])
 def sales():
@@ -218,52 +293,68 @@ def sales():
     if request.method == 'POST':
         data = request.json
         try:
-            # 재고 확인
-            cursor.execute('SELECT quantity FROM inventory WHERE product_id=?', (data['product_id'],))
-            current_qty = cursor.fetchone()[0]
+            cursor.execute('SELECT quantity FROM inventory WHERE product_id=%s', (data['product_id'],))
+            result = cursor.fetchone()
+            if not result:
+                conn.close()
+                return jsonify({'success': False, 'message': '제품을 찾을 수 없습니다'}), 404
+                
+            current_qty = result['quantity']
             
             if current_qty < data['quantity']:
+                conn.close()
                 return jsonify({'success': False, 'message': '재고가 부족합니다'}), 400
             
-            # 판매 등록
             subtotal = data['quantity'] * data['unit_price']
             cursor.execute(
-                'INSERT INTO sales (customer_id, total_amount, notes) VALUES (?, ?, ?)',
+                'INSERT INTO sales (customer_id, total_amount, notes) VALUES (%s, %s, %s) RETURNING sale_id',
                 (data['customer_id'], subtotal, data.get('notes', ''))
             )
-            sale_id = cursor.lastrowid
+            result = cursor.fetchone()
+            sale_id = result['sale_id']
             
             cursor.execute(
-                'INSERT INTO sale_details (sale_id, product_id, quantity, unit_price, subtotal) VALUES (?, ?, ?, ?, ?)',
+                'INSERT INTO sale_details (sale_id, product_id, quantity, unit_price, subtotal) VALUES (%s, %s, %s, %s, %s)',
                 (sale_id, data['product_id'], data['quantity'], data['unit_price'], subtotal)
             )
             
-            # 재고 차감
             new_qty = current_qty - data['quantity']
-            cursor.execute('UPDATE inventory SET quantity=? WHERE product_id=?', (new_qty, data['product_id']))
+            cursor.execute('UPDATE inventory SET quantity=%s WHERE product_id=%s', (new_qty, data['product_id']))
             
             conn.commit()
+            conn.close()
             return jsonify({'success': True, 'message': '판매가 등록되었습니다', 'sale_id': sale_id})
         except Exception as e:
             conn.rollback()
-            return jsonify({'success': False, 'message': str(e)}), 500
-        finally:
             conn.close()
+            return jsonify({'success': False, 'message': str(e)}), 500
     
     else:  # GET
-        cursor.execute('''
-            SELECT s.sale_id, s.sale_date, c.customer_name, p.product_name, 
-                   sd.quantity, sd.unit_price, sd.subtotal, s.payment_status
-            FROM sales s
-            JOIN customers c ON s.customer_id = c.customer_id
-            JOIN sale_details sd ON s.sale_id = sd.sale_id
-            JOIN products p ON sd.product_id = p.product_id
-            ORDER BY s.sale_id DESC LIMIT 200
-        ''')
-        sales = [dict(row) for row in cursor.fetchall()]
+        try:
+            cursor.execute('''
+                SELECT s.sale_id, s.sale_date, c.customer_name, p.product_name, 
+                       sd.quantity, sd.unit_price, sd.subtotal, s.payment_status
+                FROM sales s
+                JOIN customers c ON s.customer_id = c.customer_id
+                JOIN sale_details sd ON s.sale_id = sd.sale_id
+                JOIN products p ON sd.product_id = p.product_id
+                ORDER BY s.sale_id DESC LIMIT 200
+            ''')
+            sales = cursor.fetchall()
+            conn.close()
+            return jsonify(sales)
+        except Exception as e:
+            conn.close()
+            return jsonify({'error': str(e)}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    try:
+        conn = get_db()
         conn.close()
-        return jsonify(sales)
+        return jsonify({'status': 'healthy', 'database': 'connected'})
+    except Exception as e:
+        return jsonify({'status': 'unhealthy', 'error': str(e)}), 500
 
 if __name__ == '__main__':
-    init_db()
     app.run(debug=True)
