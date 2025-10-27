@@ -50,7 +50,7 @@ import shutil
 class InventoryManagementSystem:
     def __init__(self, root):
         self.root = root
-        self.root.title("판매재고관리시스템JK v2.1")
+        self.root.title("판매재고관리시스템JK v2.6")
         self.root.geometry("1280x768")
 
         self.db_path = self.get_db_path()
@@ -1080,3 +1080,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
